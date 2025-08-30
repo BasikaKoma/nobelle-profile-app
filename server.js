@@ -10,19 +10,14 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/**
- * In-memory αποθήκευση token για δοκιμές.
- * (Σε production βάλ’ το σε DB/kv.)
- */
+/* ================= In-memory tokens (demo) ================= */
 const shopTokens = new Map();
 
-/* ------------------------ Helpers ------------------------ */
-
-/** Απλό check για έγκυρο myshopify domain */
+/* ================= Helpers ================= */
 const isValidShop = (shop) =>
   typeof shop === "string" && /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop);
 
-/** Verify HMAC (OAuth callback) */
+/** Verify OAuth callback HMAC */
 function verifyCallbackHmac(query, secret) {
   const { hmac, ...rest } = query;
   const message = qs.stringify(rest, { encode: false });
@@ -30,22 +25,30 @@ function verifyCallbackHmac(query, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
+/** ✅ Verify App Proxy signature using the RAW query string (no reordering, no decoding) */
 function verifyAppProxySignature(req, secret) {
-  // Παίρνουμε το raw query string όπως ήρθε (χωρίς reorder/encode changes)
   const originalUrl = req.originalUrl || "";
   const qIndex = originalUrl.indexOf("?");
   if (qIndex === -1) return false;
 
-  const rawQS = originalUrl.slice(qIndex + 1); // ό,τι υπάρχει μετά το '?'
-  // βγάζουμε ΜΟΝΟ το signature=... αλλά κρατάμε την ίδια σειρά & encoding
-  const parts = rawQS.split("&").filter(p => !p.startsWith("signature="));
-  const message = parts.join("&");
+  const rawQS = originalUrl.slice(qIndex + 1);
 
-  // Εξάγουμε το signature από το raw query (χωρίς να αλλάξουμε σειρά/encoding)
-  const sigMatch = rawQS.match(/(?:^|&)signature=([0-9a-fA-F]+)/);
-  const provided = sigMatch ? sigMatch[1] : null;
+  // Βγάλε ΜΟΝΟ το signature=..., κράτα την αρχική σειρά/encoding των λοιπών παραμέτρων
+  const parts = rawQS.split("&");
+  let provided = null;
+  const filtered = [];
+
+  for (const p of parts) {
+    if (p.startsWith("signature=")) {
+      provided = p.slice("signature=".length);
+    } else {
+      filtered.push(p);
+    }
+  }
+
   if (!provided) return false;
 
+  const message = filtered.join("&"); // raw, same order
   const expected = crypto.createHmac("sha256", secret).update(message).digest("hex");
 
   try {
@@ -55,14 +58,10 @@ function verifyAppProxySignature(req, secret) {
   }
 }
 
-
-/* ------------------------ Routes ------------------------ */
+/* ================= Routes ================= */
 
 /** Health */
 app.get("/health", (req, res) => {
-  // Αν θέλεις auto-OAuth όταν δεν υπάρχει token, ξεκλείδωσε τα παρακάτω 2 lines:
-  // const shop = (req.query.shop || "").toString();
-  // if (isValidShop(shop) && !shopTokens.get(shop)) return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
   res.status(200).send("ok");
 });
 
@@ -71,7 +70,7 @@ app.get("/auth", (req, res) => {
   const shop = (req.query.shop || "").toString();
   if (!isValidShop(shop)) return res.status(400).send("Missing/invalid shop param");
 
-  const state = crypto.randomBytes(16).toString("hex"); // μπορείς να το σώσεις σε cookie/session για CSRF
+  const state = crypto.randomBytes(16).toString("hex");
   const redirectUri = `${process.env.HOST}/auth/callback`;
   const scopes = process.env.SCOPES;
 
@@ -95,19 +94,13 @@ app.get("/auth", (req, res) => {
 app.get("/auth/callback", async (req, res) => {
   try {
     const { shop, code, hmac } = req.query;
+    if (!isValidShop(shop) || !code || !hmac) return res.status(400).send("Missing params");
 
-    if (!isValidShop(shop) || !code || !hmac) {
-      return res.status(400).send("Missing params");
-    }
-
-    // HMAC verification (ασφάλεια)
-    const ok = verifyCallbackHmac(req.query, process.env.SHOPIFY_API_SECRET);
-    if (!ok) {
-      console.error("❌ HMAC verification failed");
+    if (!verifyCallbackHmac(req.query, process.env.SHOPIFY_API_SECRET)) {
+      console.error("❌ OAuth HMAC verification failed");
       return res.status(401).send("Invalid HMAC");
     }
 
-    // Exchange code → access token
     const tokenUrl = `https://${shop}/admin/oauth/access_token`;
     const response = await fetch(tokenUrl, {
       method: "POST",
@@ -130,7 +123,6 @@ app.get("/auth/callback", async (req, res) => {
     shopTokens.set(shop, accessToken);
     console.log("✅ ACCESS TOKEN (masked):", (accessToken || "").slice(0, 6), "...");
 
-    // Επιστροφή στο app UI (βάζω health για απλότητα)
     res.redirect(`/health?shop=${encodeURIComponent(shop)}`);
   } catch (err) {
     console.error("Auth callback error:", err);
@@ -147,18 +139,24 @@ app.get("/proxy/health", (req, res) => {
   }
   res.json({ ok: true, route: "proxy/health" });
 });
+
 /** 4) App Proxy example (POST) */
 app.post("/proxy/update-customer", (req, res) => {
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
-  if (!ok) return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
-
-  // εδώ θα καλέσεις Admin API με το token του συγκεκριμένου shop
-  // const shop = req.query.shop; const token = shopTokens.get(shop);
+  if (!ok) {
+    console.warn("Proxy HMAC fail (POST):", req.originalUrl);
+    return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+  }
   res.json({ ok: true, received: req.body });
 });
 
-/* ------------------------ Start server ------------------------ */
+/** (Optional) Debug: check token presence */
+app.get("/debug/has-token", (req, res) => {
+  const shop = (req.query.shop || "").toString();
+  res.json({ shop, hasToken: !!shopTokens.get(shop) });
+});
 
+/* ================= Start ================= */
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
