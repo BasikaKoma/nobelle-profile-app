@@ -23,7 +23,7 @@ function verifyCallbackHmac(query, secret) {
   const message = qs.stringify(rest, { encode: false });
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest, 'hex'), Buffer.from(hmac, 'hex'));
+    return crypto.timingSafeEqual(Buffer.from(digest, "hex"), Buffer.from(hmac, "hex"));
   } catch {
     return false;
   }
@@ -31,6 +31,7 @@ function verifyCallbackHmac(query, secret) {
 
 /**
  * Verify App Proxy Signature
+ * Shopify υπογράφει: path + sorted query params (ΧΩΡΙΣ το signature)
  */
 function verifyAppProxySignature(req, secret) {
   const { signature, ...otherParams } = req.query || {};
@@ -44,7 +45,9 @@ function verifyAppProxySignature(req, secret) {
     })
     .join("");
 
-  const calculated = crypto.createHmac("sha256", secret).update(sortedParams).digest("hex");
+  const path = req.path || ""; // π.χ. "/proxy/save-customer-metafields"
+  const toSign = `${path}${sortedParams}`;
+  const calculated = crypto.createHmac("sha256", secret).update(toSign).digest("hex");
 
   try {
     return crypto.timingSafeEqual(Buffer.from(calculated, "hex"), Buffer.from(signature, "hex"));
@@ -112,7 +115,6 @@ app.get("/auth/callback", async (req, res) => {
     shopTokens.set(shop, accessToken);
     console.log("✅ Access token stored for", shop);
 
-    // Redirect to success page
     res.send(`
       <html>
         <body>
@@ -145,7 +147,42 @@ app.get("/proxy/health", (req, res) => {
   });
 });
 
-/** 4) App Proxy: save customer metafields (POST) */
+/** 4) App Proxy: prefill customer metafields (GET) */
+app.get("/proxy/get-customer-metafields", async (req, res) => {
+  try {
+    if (!verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET)) {
+      return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+    }
+
+    const shop = (req.query.shop || "").toString();
+    const customerId = (req.query.logged_in_customer_id || "").toString(); // από App Proxy
+    if (!shop || !customerId) return res.status(400).json({ ok: false, error: "Missing shop/customerId" });
+
+    const token = shopTokens.get(shop);
+    if (!token) return res.status(401).json({ ok: false, error: "No token for shop" });
+
+    const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-07";
+    const base = `https://${shop}/admin/api/${apiVersion}`;
+
+    const r = await fetch(`${base}/customers/${customerId}/metafields.json?namespace=nobelle`, {
+      headers: { "X-Shopify-Access-Token": token },
+    });
+    const data = await r.json();
+
+    // Κάνε map σε key:value για ευκολία στο UI
+    const out = {};
+    (data.metafields || []).forEach((m) => {
+      out[m.key] = m.value;
+    });
+
+    return res.json({ ok: true, customerId, namespace: "nobelle", metafields: out, raw: data.metafields || [] });
+  } catch (e) {
+    console.error("prefill error", e);
+    return res.status(500).json({ ok: false, error: "prefill_failed" });
+  }
+});
+
+/** 5) App Proxy: save customer metafields (POST) */
 app.post("/proxy/save-customer-metafields", async (req, res) => {
   try {
     // 1) Verify Proxy signature
@@ -161,64 +198,72 @@ app.post("/proxy/save-customer-metafields", async (req, res) => {
     }
 
     // 3) Get data from UI
-    const { customerId, company_name, vat_number, phone, profile_note } = req.body || {};
+    const { customerId, company_name, vat_number, phone, profile_note, birthday, preferences } = req.body || {};
     if (!customerId) return res.status(400).json({ ok: false, error: "Missing customerId" });
 
     console.log("📝 Saving metafields for customer:", customerId);
 
     const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-07";
     const base = `https://${shop}/admin/api/${apiVersion}`;
-    
+
     // 4) Build metafields to write
     const metafieldsToWrite = [];
-    if (company_name !== undefined && company_name !== "")
+    if (company_name != null && company_name !== "")
       metafieldsToWrite.push({ namespace: "nobelle", key: "company_name", type: "single_line_text_field", value: String(company_name) });
-    if (vat_number !== undefined && vat_number !== "")
+    if (vat_number != null && vat_number !== "")
       metafieldsToWrite.push({ namespace: "nobelle", key: "vat_number", type: "single_line_text_field", value: String(vat_number) });
-    if (phone !== undefined && phone !== "")
+    if (phone != null && phone !== "")
       metafieldsToWrite.push({ namespace: "nobelle", key: "phone", type: "single_line_text_field", value: String(phone) });
-    if (profile_note !== undefined && profile_note !== "")
+    if (profile_note != null && profile_note !== "")
       metafieldsToWrite.push({ namespace: "nobelle", key: "profile_note", type: "multi_line_text_field", value: String(profile_note) });
+    if (birthday != null && birthday !== "")
+      metafieldsToWrite.push({ namespace: "nobelle", key: "birthday", type: "date", value: String(birthday) }); // YYYY-MM-DD
+    if (preferences != null)
+      metafieldsToWrite.push({ namespace: "nobelle", key: "preferences", type: "json", value: JSON.stringify(preferences) });
 
     if (!metafieldsToWrite.length)
       return res.status(400).json({ ok: false, error: "No fields provided" });
 
-    // 5) Create/update metafields one by one
+    // 5) Create/update metafields one by one (REST)
     const results = [];
     const errors = [];
-    
+
     for (const mf of metafieldsToWrite) {
       try {
         const resp = await fetch(`${base}/customers/${customerId}/metafields.json`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-Shopify-Access-Token": token
+            "X-Shopify-Access-Token": token,
           },
-          body: JSON.stringify({ metafield: mf })
+          body: JSON.stringify({ metafield: mf }),
         });
-        
+
         const data = await resp.json();
-        
+
         if (!resp.ok) {
           // Try to update if it exists
-          if (data.errors && data.errors.metafield && data.errors.metafield.includes("has already been taken")) {
-            // Get existing metafield
-            const searchResp = await fetch(`${base}/customers/${customerId}/metafields.json?namespace=${mf.namespace}&key=${mf.key}`, {
-              headers: { "X-Shopify-Access-Token": token }
-            });
+          const msg = JSON.stringify(data);
+          const alreadyTaken =
+            (data?.errors?.metafield && String(data.errors.metafield).includes("has already been taken")) ||
+            msg.includes("has already been taken");
+
+          if (alreadyTaken) {
+            const searchResp = await fetch(
+              `${base}/customers/${customerId}/metafields.json?namespace=${mf.namespace}&key=${mf.key}`,
+              { headers: { "X-Shopify-Access-Token": token } }
+            );
             const searchData = await searchResp.json();
-            
+
             if (searchData.metafields && searchData.metafields.length > 0) {
               const existingId = searchData.metafields[0].id;
-              // Update it
               const updateResp = await fetch(`${base}/metafields/${existingId}.json`, {
                 method: "PUT",
                 headers: {
                   "Content-Type": "application/json",
-                  "X-Shopify-Access-Token": token
+                  "X-Shopify-Access-Token": token,
                 },
-                body: JSON.stringify({ metafield: { id: existingId, value: mf.value } })
+                body: JSON.stringify({ metafield: { id: existingId, value: mf.value } }),
               });
               const updateData = await updateResp.json();
               if (updateResp.ok) {
@@ -226,6 +271,8 @@ app.post("/proxy/save-customer-metafields", async (req, res) => {
               } else {
                 errors.push({ field: mf.key, error: updateData });
               }
+            } else {
+              errors.push({ field: mf.key, error: "Existing metafield not found for update" });
             }
           } else {
             errors.push({ field: mf.key, error: data });
@@ -242,25 +289,24 @@ app.post("/proxy/save-customer-metafields", async (req, res) => {
       console.error("⚠️ Some metafields had errors:", errors);
     }
 
-    return res.json({ 
-      ok: true, 
+    return res.json({
+      ok: true,
       saved: results,
-      errors: errors.length > 0 ? errors : undefined
+      errors: errors.length > 0 ? errors : undefined,
     });
-    
   } catch (e) {
     console.error("❌ save-customer-metafields error:", e);
     res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-/** 5) Debug: check token presence */
+/** 6) Debug: check token presence */
 app.get("/debug/has-token", (req, res) => {
   const shop = (req.query.shop || "").toString();
   res.json({ shop, hasToken: !!shopTokens.get(shop) });
 });
 
-/** 6) Debug: list all shops with tokens */
+/** 7) Debug: list all shops with tokens */
 app.get("/debug/shops", (_req, res) => {
   const shops = Array.from(shopTokens.keys());
   res.json({ shops, count: shops.length });
@@ -271,6 +317,6 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
   console.log(`🌐 HOST: ${process.env.HOST}`);
-  console.log(`🔑 API Key: ${process.env.SHOPIFY_API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`🔐 API Secret: ${process.env.SHOPIFY_API_SECRET ? '✅ Configured' : '❌ Missing'}`);
+  console.log(`🔑 API Key: ${process.env.SHOPIFY_API_KEY ? "✅ Configured" : "❌ Missing"}`);
+  console.log(`🔐 API Secret: ${process.env.SHOPIFY_API_SECRET ? "✅ Configured" : "❌ Missing"}`);
 });
