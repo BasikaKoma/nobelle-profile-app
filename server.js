@@ -25,47 +25,50 @@ function verifyCallbackHmac(query, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
+/**
+ * Verify App Proxy Signature
+ * Shopify signs: path + sorted query params (without signature)
+ */
 function verifyAppProxySignature(req, secret) {
-  const originalUrl = req.originalUrl || "";
-  const qIndex = originalUrl.indexOf("?");
-  if (qIndex === -1) return false;
-
-  const rawQS = originalUrl.slice(qIndex + 1);
-
-  // 1) Πάρε το signature όπως ήρθε και φτιάξε το raw query ΧΩΡΙΣ το signature
-  const parts = rawQS.split("&");
-  let provided = null;
-  const filtered = [];
-  for (const p of parts) {
-    if (p.startsWith("signature=")) {
-      provided = p.slice("signature=".length);
-    } else {
-      filtered.push(p); // κρατάμε ίδια σειρά & encoding
-    }
+  const { signature, ...otherParams } = req.query;
+  
+  if (!signature) {
+    console.log("❌ No signature provided");
+    return false;
   }
-  if (!provided) return false;
 
-  // 2) Ανακατασκεύασε το ΥΠΟΓΕΓΡΑΜΜΕΝΟ PATH του Shopify:
-  // path_prefix= %2Fapps%2Fnobelle-profile  (decoded: /apps/nobelle-profile)
-  // + το υπόλοιπο κομμάτι route μετά το prefix, π.χ. "/health"
-  const urlParams = new URLSearchParams(rawQS);
-  const pathPrefix = decodeURIComponent(urlParams.get("path_prefix") || "");
-  const proxyRemainder = req.path.replace(/^\/proxy/, ""); // π.χ. "/health"
+  // Sort parameters alphabetically by key
+  const sortedParams = Object.keys(otherParams)
+    .sort()
+    .map(key => {
+      const value = Array.isArray(otherParams[key]) 
+        ? otherParams[key].join(',') 
+        : otherParams[key];
+      return `${key}=${value}`;
+    })
+    .join('');
 
-  const signedPath = `${pathPrefix}${proxyRemainder}`; // π.χ. "/apps/nobelle-profile/health"
+  console.log("🔍 Verifying App Proxy signature:");
+  console.log("- Sorted params string:", sortedParams);
+  console.log("- Provided signature:", signature);
 
-  // 3) Μήνυμα προς υπογραφή: "<signedPath>?<query_without_signature>"
-  const message = filtered.length ? `${signedPath}?${filtered.join("&")}` : signedPath;
-
-  const expected = crypto.createHmac("sha256", secret).update(message).digest("hex");
+  const calculated = crypto
+    .createHmac("sha256", secret)
+    .update(sortedParams)
+    .digest("hex");
+  
+  console.log("- Calculated signature:", calculated);
 
   try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
-  } catch {
+    return crypto.timingSafeEqual(
+      Buffer.from(calculated, 'hex'),
+      Buffer.from(signature, 'hex')
+    );
+  } catch (err) {
+    console.error("❌ Signature comparison error:", err);
     return false;
   }
 }
-
 
 /* ================= Routes ================= */
 
@@ -141,22 +144,79 @@ app.get("/auth/callback", async (req, res) => {
 
 /** 3) App Proxy health (GET) */
 app.get("/proxy/health", (req, res) => {
+  console.log("📍 Proxy health check");
+  console.log("- Path:", req.path);
+  console.log("- Query params:", req.query);
+  
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
+  
   if (!ok) {
-    console.warn("Proxy HMAC fail:", req.originalUrl);
-    return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+    console.warn("❌ Proxy signature verification failed");
+    return res.status(401).json({ 
+      ok: false, 
+      error: "Invalid proxy signature",
+      debug: {
+        path: req.path,
+        query: req.query
+      }
+    });
   }
-  res.json({ ok: true, route: "proxy/health" });
+  
+  console.log("✅ Proxy signature verified successfully");
+  res.json({ 
+    ok: true, 
+    route: "proxy/health",
+    timestamp: new Date().toISOString(),
+    shop: req.query.shop || "unknown"
+  });
 });
 
 /** 4) App Proxy example (POST) */
 app.post("/proxy/update-customer", (req, res) => {
+  console.log("📍 Proxy update-customer");
+  console.log("- Path:", req.path);
+  console.log("- Query params:", req.query);
+  console.log("- Body:", req.body);
+  
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
+  
   if (!ok) {
-    console.warn("Proxy HMAC fail (POST):", req.originalUrl);
-    return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+    console.warn("❌ Proxy signature verification failed (POST)");
+    return res.status(401).json({ 
+      ok: false, 
+      error: "Invalid proxy signature" 
+    });
   }
-  res.json({ ok: true, received: req.body });
+  
+  console.log("✅ Proxy signature verified successfully (POST)");
+  res.json({ 
+    ok: true, 
+    received: req.body,
+    shop: req.query.shop || "unknown"
+  });
+});
+
+/** 5) Debug endpoint για να δούμε τι στέλνει το Shopify */
+app.all("/proxy/*", (req, res) => {
+  console.log("🔍 DEBUG - Catch-all proxy route");
+  console.log("- Method:", req.method);
+  console.log("- Path:", req.path);
+  console.log("- Original URL:", req.originalUrl);
+  console.log("- Query:", req.query);
+  console.log("- Headers:", req.headers);
+  
+  // Προσπάθησε να επαληθεύσεις την υπογραφή
+  const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
+  
+  res.json({
+    ok,
+    debug: {
+      method: req.method,
+      path: req.path,
+      query: req.query,
+      signature_valid: ok
+    }
+  });
 });
 
 /** (Optional) Debug: check token presence */
@@ -168,6 +228,8 @@ app.get("/debug/has-token", (req, res) => {
 /* ================= Start ================= */
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-  console.log("HOST:", process.env.HOST);
+  console.log(`🚀 Server running on port ${port}`);
+  console.log("🌐 HOST:", process.env.HOST);
+  console.log("🔑 API Key configured:", !!process.env.SHOPIFY_API_KEY);
+  console.log("🔐 API Secret configured:", !!process.env.SHOPIFY_API_SECRET);
 });
