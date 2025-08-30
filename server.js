@@ -23,6 +23,12 @@ app.get("/auth", (req, res) => {
   const redirectUri = `${process.env.HOST}/auth/callback`;
   const scopes = process.env.SCOPES;
 
+  console.log("⚡️ AUTH request:");
+  console.log("- shop:", shop);
+  console.log("- client_id (SHOPIFY_API_KEY):", process.env.SHOPIFY_API_KEY?.slice(0, 6) + "..."); // δείχνει μόνο τα πρώτα 6 chars για έλεγχο
+  console.log("- redirectUri:", redirectUri);
+  console.log("- scopes:", scopes);
+
   const installUrl =
     `https://${shop}/admin/oauth/authorize?` +
     `client_id=${process.env.SHOPIFY_API_KEY}` +
@@ -31,6 +37,7 @@ app.get("/auth", (req, res) => {
 
   res.redirect(installUrl);
 });
+
 
 /**
  * 2. OAuth Callback
