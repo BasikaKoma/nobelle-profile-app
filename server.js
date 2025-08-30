@@ -141,10 +141,12 @@ app.get("/auth/callback", async (req, res) => {
 /** 3) App Proxy health (GET) */
 app.get("/proxy/health", (req, res) => {
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
-  if (!ok) return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+  if (!ok) {
+    console.warn("Proxy HMAC fail:", req.originalUrl);
+    return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+  }
   res.json({ ok: true, route: "proxy/health" });
 });
-
 /** 4) App Proxy example (POST) */
 app.post("/proxy/update-customer", (req, res) => {
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
