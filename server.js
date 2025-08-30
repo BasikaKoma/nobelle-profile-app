@@ -30,17 +30,31 @@ function verifyCallbackHmac(query, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-/** Verify App Proxy signature (Shopify στέλνει `signature`) */
 function verifyAppProxySignature(req, secret) {
-  // Παίρνουμε ολόκληρο το original query string χωρίς το `signature`
-  const url = new URL(`${process.env.HOST}${req.originalUrl}`);
-  const signature = url.searchParams.get("signature");
-  url.searchParams.delete("signature");
-  const queryString = url.searchParams.toString(); // already sorted by URLSearchParams
+  // Παίρνουμε το raw query string όπως ήρθε (χωρίς reorder/encode changes)
+  const originalUrl = req.originalUrl || "";
+  const qIndex = originalUrl.indexOf("?");
+  if (qIndex === -1) return false;
 
-  const digest = crypto.createHmac("sha256", secret).update(queryString).digest("hex");
-  return signature && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+  const rawQS = originalUrl.slice(qIndex + 1); // ό,τι υπάρχει μετά το '?'
+  // βγάζουμε ΜΟΝΟ το signature=... αλλά κρατάμε την ίδια σειρά & encoding
+  const parts = rawQS.split("&").filter(p => !p.startsWith("signature="));
+  const message = parts.join("&");
+
+  // Εξάγουμε το signature από το raw query (χωρίς να αλλάξουμε σειρά/encoding)
+  const sigMatch = rawQS.match(/(?:^|&)signature=([0-9a-fA-F]+)/);
+  const provided = sigMatch ? sigMatch[1] : null;
+  if (!provided) return false;
+
+  const expected = crypto.createHmac("sha256", secret).update(message).digest("hex");
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+  } catch {
+    return false;
+  }
 }
+
 
 /* ------------------------ Routes ------------------------ */
 
