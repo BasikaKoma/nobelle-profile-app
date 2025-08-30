@@ -25,7 +25,6 @@ function verifyCallbackHmac(query, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-/** ✅ Verify App Proxy signature using the RAW query string (no reordering, no decoding) */
 function verifyAppProxySignature(req, secret) {
   const originalUrl = req.originalUrl || "";
   const qIndex = originalUrl.indexOf("?");
@@ -33,22 +32,31 @@ function verifyAppProxySignature(req, secret) {
 
   const rawQS = originalUrl.slice(qIndex + 1);
 
-  // Βγάλε ΜΟΝΟ το signature=..., κράτα την αρχική σειρά/encoding των λοιπών παραμέτρων
+  // 1) Πάρε το signature όπως ήρθε και φτιάξε το raw query ΧΩΡΙΣ το signature
   const parts = rawQS.split("&");
   let provided = null;
   const filtered = [];
-
   for (const p of parts) {
     if (p.startsWith("signature=")) {
       provided = p.slice("signature=".length);
     } else {
-      filtered.push(p);
+      filtered.push(p); // κρατάμε ίδια σειρά & encoding
     }
   }
-
   if (!provided) return false;
 
-  const message = filtered.join("&"); // raw, same order
+  // 2) Ανακατασκεύασε το ΥΠΟΓΕΓΡΑΜΜΕΝΟ PATH του Shopify:
+  // path_prefix= %2Fapps%2Fnobelle-profile  (decoded: /apps/nobelle-profile)
+  // + το υπόλοιπο κομμάτι route μετά το prefix, π.χ. "/health"
+  const urlParams = new URLSearchParams(rawQS);
+  const pathPrefix = decodeURIComponent(urlParams.get("path_prefix") || "");
+  const proxyRemainder = req.path.replace(/^\/proxy/, ""); // π.χ. "/health"
+
+  const signedPath = `${pathPrefix}${proxyRemainder}`; // π.χ. "/apps/nobelle-profile/health"
+
+  // 3) Μήνυμα προς υπογραφή: "<signedPath>?<query_without_signature>"
+  const message = filtered.length ? `${signedPath}?${filtered.join("&")}` : signedPath;
+
   const expected = crypto.createHmac("sha256", secret).update(message).digest("hex");
 
   try {
@@ -57,6 +65,7 @@ function verifyAppProxySignature(req, secret) {
     return false;
   }
 }
+
 
 /* ================= Routes ================= */
 
