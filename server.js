@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
@@ -17,55 +18,49 @@ const shopTokens = new Map();
 const isValidShop = (shop) =>
   typeof shop === "string" && /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop);
 
-/** Verify OAuth callback HMAC */
+const mask = (val = "", visible = 6) =>
+  typeof val === "string" && val.length > visible ? `${val.slice(0, visible)}...` : val;
+
+/** Verify OAuth callback HMAC (Shopify OAuth) */
 function verifyCallbackHmac(query, secret) {
   const { hmac, ...rest } = query;
   const message = qs.stringify(rest, { encode: false });
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+  try {
+    const a = Buffer.from(digest, "utf8");
+    const b = Buffer.from(hmac, "utf8");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Verify App Proxy Signature
- * Shopify signs: path + sorted query params (without signature)
+ * Shopify στέλνει ?signature=<hex>. Υπογράφουμε την αλφαβητικά ταξινομημένη query-string (χωρίς το 'signature').
+ * (Σημ.: Αυτή η υλοποίηση είναι συμβατή με το working endpoint σου.)
  */
 function verifyAppProxySignature(req, secret) {
-  const { signature, ...otherParams } = req.query;
-  
-  if (!signature) {
-    console.log("❌ No signature provided");
-    return false;
-  }
+  const { signature, ...otherParams } = req.query || {};
+  if (!signature) return false;
 
-  // Sort parameters alphabetically by key
   const sortedParams = Object.keys(otherParams)
     .sort()
-    .map(key => {
-      const value = Array.isArray(otherParams[key]) 
-        ? otherParams[key].join(',') 
-        : otherParams[key];
+    .map((key) => {
+      const value = Array.isArray(otherParams[key]) ? otherParams[key].join(",") : otherParams[key];
       return `${key}=${value}`;
     })
-    .join('');
+    .join("");
 
-  console.log("🔍 Verifying App Proxy signature:");
-  console.log("- Sorted params string:", sortedParams);
-  console.log("- Provided signature:", signature);
-
-  const calculated = crypto
-    .createHmac("sha256", secret)
-    .update(sortedParams)
-    .digest("hex");
-  
-  console.log("- Calculated signature:", calculated);
+  const calculated = crypto.createHmac("sha256", secret).update(sortedParams).digest("hex");
 
   try {
-    return crypto.timingSafeEqual(
-      Buffer.from(calculated, 'hex'),
-      Buffer.from(signature, 'hex')
-    );
-  } catch (err) {
-    console.error("❌ Signature comparison error:", err);
+    const a = Buffer.from(calculated, "hex");
+    const b = Buffer.from(signature, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
     return false;
   }
 }
@@ -73,7 +68,7 @@ function verifyAppProxySignature(req, secret) {
 /* ================= Routes ================= */
 
 /** Health */
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.status(200).send("ok");
 });
 
@@ -84,22 +79,16 @@ app.get("/auth", (req, res) => {
 
   const state = crypto.randomBytes(16).toString("hex");
   const redirectUri = `${process.env.HOST}/auth/callback`;
-  const scopes = process.env.SCOPES;
+  const scopes = process.env.SCOPES || "";
 
-  console.log("⚡️ AUTH request:");
-  console.log("- shop:", shop);
-  console.log("- client_id (SHOPIFY_API_KEY):", (process.env.SHOPIFY_API_KEY || "").slice(0, 6) + "...");
-  console.log("- redirectUri:", redirectUri);
-  console.log("- scopes:", scopes);
+  const url = new URL(`https://${shop}/admin/oauth/authorize`);
+  url.searchParams.set("client_id", process.env.SHOPIFY_API_KEY);
+  url.searchParams.set("scope", scopes);
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("state", state);
 
-  const installUrl =
-    `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${encodeURIComponent(process.env.SHOPIFY_API_KEY)}` +
-    `&scope=${encodeURIComponent(scopes)}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
-
-  res.redirect(installUrl);
+  console.log("⚡️ AUTH request:", { shop, client_id: mask(process.env.SHOPIFY_API_KEY), redirectUri, scopes });
+  res.redirect(url.toString());
 });
 
 /** 2) OAuth callback */
@@ -124,16 +113,16 @@ app.get("/auth/callback", async (req, res) => {
       }),
     });
 
+    const text = await response.text();
     if (!response.ok) {
-      const text = await response.text();
       console.error("❌ Token exchange failed:", text);
       return res.status(500).send("Token exchange failed");
     }
 
-    const data = await response.json();
+    const data = JSON.parse(text);
     const accessToken = data.access_token;
     shopTokens.set(shop, accessToken);
-    console.log("✅ ACCESS TOKEN (masked):", (accessToken || "").slice(0, 6), "...");
+    console.log("✅ Access token stored for", shop, mask(accessToken));
 
     res.redirect(`/health?shop=${encodeURIComponent(shop)}`);
   } catch (err) {
@@ -144,79 +133,68 @@ app.get("/auth/callback", async (req, res) => {
 
 /** 3) App Proxy health (GET) */
 app.get("/proxy/health", (req, res) => {
-  console.log("📍 Proxy health check");
-  console.log("- Path:", req.path);
-  console.log("- Query params:", req.query);
-  
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
-  
-  if (!ok) {
-    console.warn("❌ Proxy signature verification failed");
-    return res.status(401).json({ 
-      ok: false, 
-      error: "Invalid proxy signature",
-      debug: {
-        path: req.path,
-        query: req.query
-      }
-    });
-  }
-  
-  console.log("✅ Proxy signature verified successfully");
-  res.json({ 
-    ok: true, 
+  if (!ok) return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+
+  res.json({
+    ok: true,
     route: "proxy/health",
     timestamp: new Date().toISOString(),
-    shop: req.query.shop || "unknown"
+    shop: req.query.shop || "unknown",
   });
 });
 
 /** 4) App Proxy example (POST) */
 app.post("/proxy/update-customer", (req, res) => {
-  console.log("📍 Proxy update-customer");
-  console.log("- Path:", req.path);
-  console.log("- Query params:", req.query);
-  console.log("- Body:", req.body);
-  
   const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
-  
-  if (!ok) {
-    console.warn("❌ Proxy signature verification failed (POST)");
-    return res.status(401).json({ 
-      ok: false, 
-      error: "Invalid proxy signature" 
-    });
-  }
-  
-  console.log("✅ Proxy signature verified successfully (POST)");
-  res.json({ 
-    ok: true, 
+  if (!ok) return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
+
+  res.json({
+    ok: true,
     received: req.body,
-    shop: req.query.shop || "unknown"
+    shop: req.query.shop || "unknown",
   });
 });
 
-/** 5) Debug endpoint για να δούμε τι στέλνει το Shopify */
-app.all("/proxy/*", (req, res) => {
-  console.log("🔍 DEBUG - Catch-all proxy route");
-  console.log("- Method:", req.method);
-  console.log("- Path:", req.path);
-  console.log("- Original URL:", req.originalUrl);
-  console.log("- Query:", req.query);
-  console.log("- Headers:", req.headers);
-  
-  // Προσπάθησε να επαληθεύσεις την υπογραφή
-  const ok = verifyAppProxySignature(req, process.env.SHOPIFY_API_SECRET);
-  
-  res.json({
-    ok,
-    debug: {
-      method: req.method,
-      path: req.path,
-      query: req.query,
-      signature_valid: ok
+/** 5) Admin API route για δημιουργία Metafield σε Customer */
+app.post("/api/customers/:id/metafields", async (req, res) => {
+  try {
+    const shop = (req.query.shop || "").toString();
+    const token = shopTokens.get(shop);
+    if (!shop || !token) return res.status(401).json({ ok: false, error: "No token for shop" });
+
+    const { key, value, namespace = "nobelle", type = "single_line_text_field" } = req.body || {};
+    const customerId = req.params.id;
+
+    if (!key || typeof value === "undefined") {
+      return res.status(400).json({ ok: false, error: "Missing key/value" });
     }
-  });
+
+    const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-07";
+    const endpoint = `https://${shop}/admin/api/${apiVersion}/customers/${customerId}/metafields.json`;
+
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+      },
+      body: JSON.stringify({
+        metafield: { namespace, key, type, value },
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      console.error("❌ Admin API error:", data);
+      return res.status(resp.status).json({ ok: false, error: data });
+    }
+
+    res.json({ ok: true, metafield: data.metafield });
+  } catch (e) {
+    console.error("❌ Admin API exception:", e);
+    res.status(500).json({ ok: false, error: "Admin API error" });
+  }
 });
 
 /** (Optional) Debug: check token presence */
